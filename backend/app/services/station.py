@@ -18,6 +18,7 @@ class StationService:
         *,
         keyword: str | None = None,
         status: str | None = None,
+        region: str | None = None,
         page: int = 1,
         size: int = 20,
     ) -> tuple[list[dict[str, Any]], int]:
@@ -26,6 +27,8 @@ class StationService:
             rows = [row for row in rows if keyword in str(row.get("电站编码", ""))]
         if status:
             rows = [row for row in rows if row.get("status") == status]
+        if region:
+            rows = [row for row in rows if region in str(row.get("所属区域", ""))]
         total = len(rows)
         start = max(page - 1, 0) * size
         return rows[start:start + size], total

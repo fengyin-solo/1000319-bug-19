@@ -1,9 +1,12 @@
 """光伏电站接口：维护电站档案，覆盖办理并网、申请限电、停运电站等动作。"""
 from __future__ import annotations
 
-from typing import Any
+import csv
+import io
+from urllib.parse import quote
 
 from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import StreamingResponse
 
 from app.schemas import ActionResult, EntryPayload, PageResult
 from app.services.station import StationService
@@ -16,18 +19,104 @@ LIST_FIELDS = ["电站编码", "电站名称", "装机容量", "并网电压等�
 STATUSES = ["在建", "已投运", "限电中", "已停运"]
 
 
+def _normalize(value: str | None) -> str | None:
+    """查询条件按空白归一：空串、纯空格视为没有填写，避免筛出一张空表。"""
+    if value is None:
+        return None
+    text = value.strip()
+    return text or None
+
+
+def _query_filters(
+    keyword: str | None,
+    status: str | None,
+    region: str | None,
+) -> dict[str, str]:
+    """列表、分页与导出共用的一套条件，口径在同一个地方收口。"""
+    status_text = _normalize(status)
+    if status_text is not None and status_text not in STATUSES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"电站状态「{status_text}」不在允许范围，可选：{'、'.join(STATUSES)}",
+        )
+    return {
+        "keyword": _normalize(keyword) or "",
+        "status": status_text or "",
+        "region": _normalize(region) or "",
+    }
+
+
 @router.get("", response_model=PageResult[dict])
 def list_entries(
     keyword: str | None = Query(default=None, description="按电站编码检索"),
     status: str | None = Query(default=None, description="在建、已投运、限电中、已停运"),
+    region: str | None = Query(default=None, description="按所属区域检索"),
     page: int = 1,
     size: int = 20,
 ) -> PageResult[dict]:
-    """按电站编码与状态过滤光伏电站列表；没有数据时返回空页，不报错。"""
+    """按电站编码、所属区域与状态过滤光伏电站列表；条件不合法时说明原因。"""
+    if page < 1:
+        raise HTTPException(status_code=400, detail="页码需从第 1 页开始，请检查翻页参数")
+    if size < 1:
+        raise HTTPException(status_code=400, detail="每页条数至少为 1")
     if size > 200:
         raise HTTPException(status_code=400, detail="每页最多 200 条，请缩小分页范围")
-    items, total = service.list_entries(keyword=keyword, status=status, page=page, size=size)
+    filters = _query_filters(keyword, status, region)
+    items, total = service.list_entries(
+        keyword=filters["keyword"] or None,
+        status=filters["status"] or None,
+        region=filters["region"] or None,
+        page=page,
+        size=size,
+    )
     return PageResult(items=items, total=total, page=page, size=size)
+
+
+@router.get("/export")
+def export_entries(
+    keyword: str | None = Query(default=None, description="按电站编码检索"),
+    status: str | None = Query(default=None, description="在建、已投运、限电中、已停运"),
+    region: str | None = Query(default=None, description="按所属区域检索"),
+) -> StreamingResponse:
+    """导出当前过滤条件下的全量电站；条件命中为空时说明原因，不给空文件。"""
+    filters = _query_filters(keyword, status, region)
+    items, total = service.list_entries(
+        keyword=filters["keyword"] or None,
+        status=filters["status"] or None,
+        region=filters["region"] or None,
+        page=1,
+        size=10000,
+    )
+    if total == 0:
+        reasons = []
+        if filters["keyword"]:
+            reasons.append(f"电站编码包含「{filters['keyword']}」")
+        if filters["region"]:
+            reasons.append(f"所属区域包含「{filters['region']}」")
+        if filters["status"]:
+            reasons.append(f"电站状态为「{filters['status']}」")
+        cause = "、".join(reasons) if reasons else "系统中尚未登记电站档案"
+        raise HTTPException(status_code=404, detail=f"当前条件（{cause}）没有命中任何电站，未生成导出文件")
+
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(LIST_FIELDS)
+    for row in items:
+        values = []
+        for field in LIST_FIELDS:
+            # 电站状态列与列表保持一致，取状态流转写入的 status，避免列内容错位
+            value = row.get("status") if field == "电站状态" else row.get(field, "")
+            values.append("" if value is None else value)
+        writer.writerow(values)
+
+    # utf-8-sig 会写入 BOM，Excel 直接打开中文表头不乱码
+    payload = buffer.getvalue().encode("utf-8-sig")
+    filename = quote("光伏电站清单.csv")
+    return StreamingResponse(
+        io.BytesIO(payload),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"},
+    )
 
 
 @router.get("/{entry_id}", response_model=dict)
@@ -56,10 +145,3 @@ def run_action(entry_id: int, payload: EntryPayload) -> ActionResult:
     if entry is None:
         return ActionResult(ok=False, message=message)
     return ActionResult(ok=True, message=message, entry=entry)
-
-
-@router.get("/export")
-def export_entries() -> dict[str, Any]:
-    """导出光伏电站清单：返回当前过滤条件下的全量数据。"""
-    items, total = service.list_entries(page=1, size=10000)
-    return {"module": "station", "total": total, "items": items}
